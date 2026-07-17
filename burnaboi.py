@@ -112,7 +112,7 @@ def prompt_burned_by() -> str:
 def prompt_burn_mode() -> str:
     while True:
         print("Burn Mode:")
-        print("[1] Audio CD (Red Book, CD only)")
+        print("[1] Audio CD (Red Book, CD only) - WORK IN PROGRESS")
         print("[2] Data CD/DVD")
         choice = input("Select mode [1/2]: ").strip()
         if choice == "1":
@@ -903,8 +903,8 @@ if ($null -eq $recorder) {{
 $format = New-Object -ComObject IMAPI2.MsftDiscFormat2TrackAtOnce
 $format.ClientName = 'optical-disc-archive-log'
 $format.Recorder = $recorder
-$format.DoNotFinalizeMedia = $false
 $format.PrepareMedia()
+$format.DoNotFinalizeMedia = $false
 foreach ($trackPath in $trackPaths) {{
     $stream = New-Object -ComObject ADODB.Stream
     $stream.Type = 1

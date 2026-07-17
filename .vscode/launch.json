@@ -5,7 +5,7 @@
       "name": "burnaboi.py",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/tools/burnaboi.py",
+      "program": "${workspaceFolder}/burnaboi.py",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal"
     },
@@ -13,7 +13,7 @@
       "name": "verify-disc-integrity.py",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/tools/verify-disc-integrity.py",
+      "program": "${workspaceFolder}/verify-disc-integrity.py",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal"
     }
