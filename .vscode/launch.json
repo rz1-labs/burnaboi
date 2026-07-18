@@ -13,7 +13,7 @@
       "name": "verify-disc-integrity.py",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/verify-disc-integrity.py",
+      "program": "${workspaceFolder}/tools/verify-disc-integrity.py",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal"
     }

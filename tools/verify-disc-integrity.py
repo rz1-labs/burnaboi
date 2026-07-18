@@ -459,7 +459,7 @@ def parse_disc_metadata(readme_path: Path) -> DiscMetadata | None:
 
 
 def find_matching_record(metadata: DiscMetadata) -> RecordMatch | None:
-	repo_root = Path(__file__).resolve().parent
+	repo_root = Path(__file__).resolve().parent.parent
 	records_root = repo_root / "records"
 	if not records_root.exists() or not records_root.is_dir():
 		return None

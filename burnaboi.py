@@ -2,6 +2,7 @@
 import re
 import sys
 import shutil
+import os
 import hashlib
 import getpass
 import json
@@ -35,6 +36,8 @@ RED_BOOK_SAMPLE_RATE = 44100
 RED_BOOK_CHANNELS = 2
 RED_BOOK_SAMPLE_WIDTH_BYTES = 2
 RED_BOOK_BYTES_PER_SECOND = RED_BOOK_SAMPLE_RATE * RED_BOOK_CHANNELS * RED_BOOK_SAMPLE_WIDTH_BYTES
+RED_BOOK_SECTOR_BYTES = 2352
+RED_BOOK_MAX_SECONDS = 80 * 60  # 80-minute CD nominal maximum
 IMAPI_MEDIA_TYPE_UNKNOWN = 0x0
 IMAPI_MEDIA_TYPE_CDROM = 0x1
 IMAPI_MEDIA_TYPE_CDR = 0x2
@@ -112,7 +115,7 @@ def prompt_burned_by() -> str:
 def prompt_burn_mode() -> str:
     while True:
         print("Burn Mode:")
-        print("[1] Audio CD (Red Book, CD only) - WORK IN PROGRESS")
+        print("[1] Audio CD (Red Book, CD only)")
         print("[2] Data CD/DVD")
         choice = input("Select mode [1/2]: ").strip()
         if choice == "1":
@@ -177,6 +180,47 @@ def get_ffmpeg_path() -> str | None:
     return shutil.which("ffmpeg")
 
 
+def get_media_duration_seconds(path: Path, ffmpeg_path: str | None = None, ffprobe_path: str | None = None) -> float:
+    """Return media duration in seconds or -1.0 if unknown.
+
+    Tries WAV via wave module, then ffprobe, then ffmpeg parsing fallback.
+    """
+    # WAV fast path
+    try:
+        if path.suffix.lower() == ".wav":
+            with wave.open(str(path), "rb") as wav_file:
+                frames = wav_file.getnframes()
+                rate = wav_file.getframerate()
+                if rate > 0:
+                    return frames / float(rate)
+    except Exception:
+        pass
+
+    # ffprobe if available
+    probe = ffprobe_path or shutil.which("ffprobe")
+    if probe:
+        code, stdout, stderr = run_command([probe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)])
+        if code == 0 and stdout.strip():
+            try:
+                return float(stdout.strip())
+            except Exception:
+                pass
+
+    # ffmpeg -i parse stderr
+    ff = ffmpeg_path or get_ffmpeg_path()
+    if ff:
+        code, stdout, stderr = run_command([ff, "-i", str(path)])
+        out = stderr or stdout
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", out)
+        if m:
+            hours = int(m.group(1))
+            minutes = int(m.group(2))
+            seconds = float(m.group(3))
+            return hours * 3600 + minutes * 60 + seconds
+
+    return -1.0
+
+
 def get_red_book_duration_from_raw_size(num_bytes: int) -> float:
     return num_bytes / RED_BOOK_BYTES_PER_SECOND
 
@@ -198,7 +242,9 @@ def validate_red_book_wav(source_path: Path) -> tuple[bool, str]:
 
 
 def prepare_red_book_track(source_path: Path, prepared_dir: Path, ffmpeg_path: str | None) -> dict[str, str | float | Path]:
-    raw_target = prepared_dir / f"{source_path.stem}.raw"
+    # Include parent folder context to avoid filename collisions when stems repeat.
+    parent_slug = re.sub(r"[^A-Za-z0-9_-]", "_", source_path.parent.name)
+    raw_target = prepared_dir / f"{parent_slug}__{source_path.stem}.raw"
 
     if ffmpeg_path:
         command = [
@@ -236,6 +282,17 @@ def prepare_red_book_track(source_path: Path, prepared_dir: Path, ffmpeg_path: s
             raw_file.write(wav_file.readframes(wav_file.getnframes()))
 
     raw_size = raw_target.stat().st_size
+    if raw_size <= 0:
+        raise RuntimeError(f"{source_path.name} converted to an empty PCM stream.")
+
+    # IMAPI Track-At-Once expects audio payload sizes aligned to 2352-byte CD sectors.
+    remainder = raw_size % RED_BOOK_SECTOR_BYTES
+    if remainder != 0:
+        pad_bytes = RED_BOOK_SECTOR_BYTES - remainder
+        with open(raw_target, "ab") as raw_file:
+            raw_file.write(b"\x00" * pad_bytes)
+        raw_size += pad_bytes
+
     duration_seconds = get_red_book_duration_from_raw_size(raw_size)
     return {
         "source_path": source_path,
@@ -468,17 +525,39 @@ def format_elapsed_time(seconds: float) -> str:
 
 def get_free_space_for_path(path_value: str) -> str:
     """Return free space for a mounted path if available."""
+    # Normalize common Windows drive-root forms (E:/, E:\\, E:) to a proper root path
+    def _normalize_path(p: str) -> str:
+        if not p:
+            return p
+        if platform.system() == "Windows":
+            m = re.match(r"^([A-Za-z]):[\\/]*$", p)
+            if m:
+                return m.group(1) + ":\\"
+        return p
+
     try:
-        usage = shutil.disk_usage(path_value)
+        usage = shutil.disk_usage(_normalize_path(path_value))
         return format_bytes(usage.free)
-    except OSError:
+    except OSError as e:
+        msg = str(e).lower()
+        if platform.system() == "Windows" and ("device is not ready" in msg or "not ready" in msg):
+            return "No writable media"
         return "Unavailable"
 
 
 def get_free_bytes_for_path(path_value: str) -> int:
     """Return raw free bytes for a path, or -1 if unavailable."""
+    def _normalize_path(p: str) -> str:
+        if not p:
+            return p
+        if platform.system() == "Windows":
+            m = re.match(r"^([A-Za-z]):[\\/]*$", p)
+            if m:
+                return m.group(1) + ":\\"
+        return p
+
     try:
-        return shutil.disk_usage(path_value).free
+        return shutil.disk_usage(_normalize_path(path_value)).free
     except OSError:
         return -1
 
@@ -536,8 +615,25 @@ def detect_optical_drives_windows() -> list[dict[str, str]]:
             burn_capable = "Unknown"
 
         if media_loaded and drive_letter:
-            free_space = get_free_space_for_path(f"{drive_letter}\\")
-            free_space_bytes = get_free_bytes_for_path(f"{drive_letter}\\")
+            probe_path = f"{drive_letter}\\"
+            free_space = get_free_space_for_path(probe_path)
+            free_space_bytes = get_free_bytes_for_path(probe_path)
+
+            # If disk_usage couldn't provide values (e.g. blank disc: "No writable media"),
+            # try an IMAPI probe to decide whether the media is a blank writable disc.
+            if (isinstance(free_space, str) and free_space in ("Unavailable", "No writable media")) or free_space_bytes == -1:
+                try:
+                    temp_drive = {"path": drive_letter}
+                    media_type_code, media_type_name = get_windows_media_type_for_drive(temp_drive)
+                    # If it's writable media (CD-R or CD-RW or similar), label as blank/unformatted.
+                    if media_type_code in {IMAPI_MEDIA_TYPE_CDR, IMAPI_MEDIA_TYPE_CDRW}:
+                        free_space = f"Blank {media_type_name} (no filesystem)"
+                        free_space_bytes = -1
+                except RuntimeError:
+                    # Fall back to previous unavailable indicators
+                    if isinstance(free_space, str) and free_space != "No writable media":
+                        free_space = "Unavailable"
+                    free_space_bytes = -1
         elif media_loaded:
             free_space = "Unavailable"
             free_space_bytes = -1
@@ -844,7 +940,7 @@ if ($null -eq $recorder) {{
     throw 'No matching recorder found for selected drive.'
 }}
 $format = New-Object -ComObject IMAPI2.MsftDiscFormat2Data
-$format.ClientName = 'optical-disc-archive-log'
+$format.ClientName = 'burnaboi'
 $format.Recorder = $recorder
 $format.ForceMediaToBeClosed = $true
 $image = New-Object -ComObject IMAPI2FS.MsftFileSystemImage
@@ -877,16 +973,17 @@ def burn_audio_cd_windows(selected_drive: dict[str, str], prepared_tracks: list[
 
     escaped_drive = drive_path.rstrip("\\") + "\\"
     escaped_drive = escaped_drive.replace("'", "''")
-    track_entries = []
+    track_paths_list = []
     for track_info in prepared_tracks:
-        raw_path = str(Path(track_info["raw_path"]).resolve()).replace("'", "''")
-        track_entries.append(f"    '{raw_path}'")
+        raw_path = str(Path(track_info["raw_path"]).resolve())
+        track_paths_list.append(raw_path)
 
-    track_paths_block = "@(\n" + ",\n".join(track_entries) + "\n)"
+    # Pass track paths as a JSON array to PowerShell to avoid quoting/escaping issues
+    track_paths_json = json.dumps(track_paths_list)
     powershell_script = f"""
 $ErrorActionPreference = 'Stop'
 $drivePath = '{escaped_drive}'
-$trackPaths = {track_paths_block}
+$trackPaths = ConvertFrom-Json '{track_paths_json}'
 $master = New-Object -ComObject IMAPI2.MsftDiscMaster2
 $recorder = $null
 foreach ($id in @($master)) {{
@@ -901,7 +998,7 @@ if ($null -eq $recorder) {{
     throw 'No matching recorder found for selected drive.'
 }}
 $format = New-Object -ComObject IMAPI2.MsftDiscFormat2TrackAtOnce
-$format.ClientName = 'optical-disc-archive-log'
+$format.ClientName = 'burnaboi'
 $format.Recorder = $recorder
 $format.PrepareMedia()
 $format.DoNotFinalizeMedia = $false
@@ -910,6 +1007,10 @@ foreach ($trackPath in $trackPaths) {{
     $stream.Type = 1
     $stream.Open()
     $stream.LoadFromFile($trackPath)
+    if ($stream.Size -le 0) {{
+        throw "Track stream is empty: $trackPath"
+    }}
+    $stream.Position = 0
     $format.AddAudioTrack($stream)
     $stream.Close()
 }}
@@ -1014,6 +1115,21 @@ def start_burn_journey(
     print(f"\n✓ Selected drive: {selected_drive['path']} ({selected_drive['model']})")
     print(f"[OK] Media loaded: {selected_drive['media_loaded']}")
     print(f"[OK] Burn capable: {selected_drive['burn_capable']}")
+    # Allow user to set audio disc length (minutes) for fit checks; default 80 minutes
+    audio_max_seconds = RED_BOOK_MAX_SECONDS
+    audio_capacity_mb = int(round((RED_BOOK_MAX_SECONDS / 60) * 8.75))  # default 80min->~700MB
+    if burn_mode == AUDIO_DISC_MODE:
+        try:
+            user_input = input(f"Specify max disc length in minutes [{int(RED_BOOK_MAX_SECONDS/60)}]: ").strip()
+            if user_input:
+                minutes = float(user_input)
+                if minutes > 0:
+                    audio_max_seconds = int(minutes * 60)
+                    audio_capacity_mb = int(round(minutes * 8.75))
+        except Exception:
+            # on invalid input, keep defaults
+            audio_max_seconds = RED_BOOK_MAX_SECONDS
+            audio_capacity_mb = int(round((RED_BOOK_MAX_SECONDS / 60) * 8.75))
 
     iteration = 0
     while True:
@@ -1023,6 +1139,49 @@ def start_burn_journey(
         refresh_readme(folder_path, disc_label, burned_by, burn_date, burn_mode, content_folder)
         compute_checksums(content_folder, folder_path, burn_mode)
         print_burn_file_review(folder_path, content_folder, burn_mode)
+
+        # Additional burn-review diagnostics
+        selected_files = get_selected_payload_files(content_folder, burn_mode)
+        payload_bytes = sum(p.stat().st_size for p in selected_files)
+        readme_path = folder_path / "README.txt"
+        checksums_path = folder_path / "checksums.sha256"
+        readme_bytes = readme_path.stat().st_size if readme_path.exists() else 0
+        checksums_bytes = checksums_path.stat().st_size if checksums_path.exists() else 0
+        staged_bytes = payload_bytes + readme_bytes + checksums_bytes
+
+        if payload_bytes == staged_bytes:
+            print(f"\n[REVIEW] Source payload size equals staged size: {format_bytes(payload_bytes)}")
+        else:
+            diff = staged_bytes - payload_bytes
+            print(f"\n[REVIEW] Source payload: {format_bytes(payload_bytes)}; Staged total (including README/checksums): {format_bytes(staged_bytes)} ({'+' if diff>0 else '-'}{format_bytes(abs(diff))} metadata)")
+
+        if burn_mode == AUDIO_DISC_MODE:
+            ffmpeg_path = get_ffmpeg_path()
+            ffprobe_path = shutil.which("ffprobe")
+            total_seconds = 0.0
+            unknown_durations = False
+            for p in selected_files:
+                d = get_media_duration_seconds(p, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path)
+                if d < 0:
+                    # fallback estimate from raw-size (best effort)
+                    est = p.stat().st_size / float(RED_BOOK_BYTES_PER_SECOND)
+                    total_seconds += est
+                    unknown_durations = True
+                else:
+                    total_seconds += d
+
+            n_tracks = len(selected_files)
+            # Reserve 2s lead-in + 2s gaps between tracks (Red Book uses 2s pregap by default)
+            reserved_seconds = 2 + (2 * max(0, n_tracks - 1)) if n_tracks > 0 else 0
+            total_required_seconds = total_seconds + reserved_seconds
+            will_fit = total_required_seconds <= audio_max_seconds
+
+            print("\n[AUDIO ESTIMATE]")
+            print(f" - Estimated audio duration: {format_audio_duration(total_seconds)} ({total_seconds:.1f}s){' (some files estimated)' if unknown_durations else ''}")
+            print(f" - Reserved for lead-in/gaps: {format_audio_duration(reserved_seconds)} ({reserved_seconds:.1f}s)")
+            print(f" - Total required (incl. reserved): {format_audio_duration(total_required_seconds)} of {format_audio_duration(audio_max_seconds)}")
+            print(f" - Disc capacity used (approx): {audio_capacity_mb} MB")
+            print(f" - Will fit on {int(audio_max_seconds/60)}-minute Red Book CD: {'Yes' if will_fit else 'No'}")
 
         print("\nBurn review options:")
         print("(C)  Confirm burn set")

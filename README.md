@@ -36,6 +36,8 @@ Important constraints:
 
 - Audio mode is CD-only, not DVD
 - Audio mode is currently implemented on Windows
+- You can burn audio CDs with `burnaboi` by selecting burn mode `1`
+- `tools/verify-disc-integrity.py` is not supported for Red Book audio CDs because the format can change track filenames and metadata (song titles and disc label)
 - Audio tracks must be converted to 44.1 kHz, 16-bit stereo PCM
 - `ffmpeg` is used when conversion is needed
 - `README.txt` and `checksums.sha256` stay in the record folder and are not written onto the audio CD
@@ -65,3 +67,9 @@ That means every burn can have:
 │   └── verify-disc-integrity.py
 └── examples/
     └── sample-record/
+```
+
+## Tested media
+
+- CD-R
+- DVD-R (single-layer)
