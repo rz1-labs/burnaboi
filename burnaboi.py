@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import re
 import sys
 import shutil
@@ -67,6 +68,10 @@ MEDIA_TYPE_NAMES = {
     0x13: "BD-RE",
 }
 
+MANIFEST_LINE_RE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(.*)$")
+DEFAULT_CONFIG_FILE = Path("burnaboi.config.json")
+DEFAULT_VERIFY_AFTER_BURN = False
+
 
 def configure_stdio() -> None:
     """Prefer UTF-8 console output and avoid crashes on non-UTF-8 Windows streams."""
@@ -93,6 +98,68 @@ def write_text_file(path: Path, content: str) -> None:
     """Write a UTF-8 text file."""
     with open(path, "w", encoding=TEXT_ENCODING) as file_handle:
         file_handle.write(content)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="burnaboi optical disc workflow")
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_FILE),
+        help="Path to JSON config file (default: burnaboi.config.json)",
+    )
+    parser.add_argument(
+        "--verify-after-burn",
+        dest="verify_after_burn",
+        action="store_true",
+        help="Force-enable verify-after-burn checks regardless of config file",
+    )
+    parser.add_argument(
+        "--no-verify-after-burn",
+        dest="verify_after_burn",
+        action="store_false",
+        help="Disable verify-after-burn checks regardless of config file",
+    )
+    parser.set_defaults(verify_after_burn=None)
+    return parser.parse_args()
+
+
+def parse_bool_config_value(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def load_runtime_config(config_path: Path) -> dict[str, bool]:
+    config = {"verify_after_burn": DEFAULT_VERIFY_AFTER_BURN}
+    if not config_path.exists():
+        return config
+
+    try:
+        payload = json.loads(read_text_file(config_path))
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"[WARN] Could not parse config file {config_path}: {error}", file=sys.stderr)
+        return config
+
+    if not isinstance(payload, dict):
+        print(f"[WARN] Config file {config_path} must contain a JSON object.", file=sys.stderr)
+        return config
+
+    parsed_value = parse_bool_config_value(payload.get("verify_after_burn"))
+    if parsed_value is None:
+        print(
+            f"[WARN] Config key 'verify_after_burn' in {config_path} is invalid; using default ({DEFAULT_VERIFY_AFTER_BURN}).",
+            file=sys.stderr,
+        )
+        return config
+
+    config["verify_after_burn"] = parsed_value
+    return config
 
 
 def prompt_disc_label() -> str:
@@ -476,6 +543,200 @@ def compute_sha256_file(filepath: Path) -> str:
         for byte_block in iter(lambda: f.read(4096), b""):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
+
+
+def normalize_manifest_path(path_text: str) -> Path:
+    normalized = path_text.strip().replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part and part != "."]
+    return Path(*parts) if parts else Path(".")
+
+
+def parse_checksums_manifest(checksums_file: Path) -> tuple[list[tuple[Path, str]], str | None]:
+    entries: list[tuple[Path, str]] = []
+    total_checksum: str | None = None
+
+    lines = read_text_file(checksums_file).splitlines()
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        match = MANIFEST_LINE_RE.match(line)
+        if not match:
+            raise ValueError(f"Unsupported checksum line at {checksums_file}:{line_number}: {raw_line}")
+
+        checksum_value = match.group(1).lower()
+        path_text = match.group(2).strip()
+        if path_text == "(total)":
+            total_checksum = checksum_value
+            continue
+
+        entries.append((normalize_manifest_path(path_text), checksum_value))
+
+    return entries, total_checksum
+
+
+def choose_verification_root(disc_root: Path, manifest_entries: list[tuple[Path, str]]) -> Path:
+    candidates = [disc_root]
+    content_candidate = disc_root / "content"
+    if content_candidate.exists() and content_candidate.is_dir():
+        candidates.append(content_candidate)
+
+    best_root = disc_root
+    best_score = -1
+    for candidate in candidates:
+        score = 0
+        for relative_path, _ in manifest_entries:
+            if (candidate / relative_path).is_file():
+                score += 1
+        if score > best_score:
+            best_root = candidate
+            best_score = score
+
+    return best_root
+
+
+def update_checksums_manifest_file(
+    checksums_file: Path,
+    per_file_updates: dict[str, str],
+    updated_total: str | None,
+) -> bool:
+    original_lines = read_text_file(checksums_file).splitlines()
+    rewritten_lines: list[str] = []
+    changed = False
+
+    for raw_line in original_lines:
+        stripped = raw_line.strip()
+        match = MANIFEST_LINE_RE.match(stripped) if stripped and not stripped.startswith("#") else None
+        if match is None:
+            rewritten_lines.append(raw_line)
+            continue
+
+        checksum_value = match.group(1).lower()
+        path_text = match.group(2).strip()
+        if path_text == "(total)":
+            if updated_total and checksum_value != updated_total:
+                rewritten_lines.append(f"{updated_total}  (total)")
+                changed = True
+            else:
+                rewritten_lines.append(raw_line)
+            continue
+
+        key = normalize_manifest_path(path_text).as_posix().lower()
+        replacement_checksum = per_file_updates.get(key)
+        if replacement_checksum and replacement_checksum != checksum_value:
+            rewritten_lines.append(f"{replacement_checksum}  {path_text}")
+            changed = True
+        else:
+            rewritten_lines.append(raw_line)
+
+    if not changed:
+        return False
+
+    write_text_file(checksums_file, "\n".join(rewritten_lines) + "\n")
+    return True
+
+
+def verify_after_burn_and_sync_checksums(selected_drive: dict[str, str], folder_path: Path, burn_mode: str) -> None:
+    print("\n" + "=" * 80)
+    print("VERIFY AFTER BURN")
+    print("=" * 80)
+
+    if burn_mode == AUDIO_DISC_MODE:
+        print("Audio CD mode writes Red Book tracks instead of file payload data.")
+        print("Post-burn SHA256 verification is skipped for audio discs.")
+        return
+
+    checksums_file = folder_path / "checksums.sha256"
+    if not checksums_file.exists():
+        print(f"[WARN] Record checksums file not found: {checksums_file}")
+        return
+
+    drive_path = selected_drive.get("path", "").strip()
+    if drive_path in ("", "Unavailable"):
+        print("[WARN] Selected drive path is unavailable; skipping verify-after-burn.")
+        return
+
+    if platform.system() == "Windows":
+        match = re.match(r"^([A-Za-z]):[\\/]*$", drive_path)
+        if match:
+            drive_path = match.group(1) + ":\\"
+    disc_root = Path(drive_path)
+    if not disc_root.exists() or not disc_root.is_dir():
+        print(f"[WARN] Disc path is not readable: {disc_root}")
+        print("       Skipping verify-after-burn.")
+        return
+
+    try:
+        manifest_entries, expected_total = parse_checksums_manifest(checksums_file)
+    except ValueError as error:
+        print(f"[WARN] Could not parse {checksums_file}: {error}")
+        return
+
+    if not manifest_entries:
+        print("[WARN] checksums.sha256 has no per-file entries to verify.")
+        return
+
+    verification_root = choose_verification_root(disc_root, manifest_entries)
+    print(f"Verification source: {verification_root}")
+
+    print("\nPer-file checksum comparison:")
+    print("-" * 80)
+    combined_hash = hashlib.sha256()
+    total_bytes = 0
+    mismatch_count = 0
+    missing_count = 0
+    per_file_updates: dict[str, str] = {}
+
+    for relative_path, expected_hash in manifest_entries:
+        target_path = verification_root / relative_path
+        display_path = relative_path.as_posix()
+        if not target_path.exists() or not target_path.is_file():
+            print(f"[MISSING] {display_path}")
+            missing_count += 1
+            continue
+
+        file_hash = hashlib.sha256()
+        with open(target_path, "rb") as file_handle:
+            for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
+                file_hash.update(chunk)
+                combined_hash.update(chunk)
+                total_bytes += len(chunk)
+
+        actual_hash = file_hash.hexdigest()
+        if actual_hash == expected_hash:
+            print(f"[OK]      {display_path}")
+        else:
+            print(f"[FAIL]    {display_path}")
+            print(f"          expected: {expected_hash}")
+            print(f"          actual:   {actual_hash}")
+            per_file_updates[display_path.lower()] = actual_hash
+            mismatch_count += 1
+
+    actual_total = combined_hash.hexdigest()
+    expected_total_value = expected_total or hashlib.sha256().hexdigest()
+    total_matches = actual_total == expected_total_value and missing_count == 0
+
+    print("\nCombined checksum comparison:")
+    print("-" * 80)
+    print(f"Files verified : {len(manifest_entries) - missing_count}/{len(manifest_entries)}")
+    print(f"Total size     : {format_bytes(total_bytes)}")
+    print(f"Expected total : {expected_total_value}")
+    print(f"Actual total   : {actual_total}")
+    print(f"Result         : {'MATCH' if total_matches else 'MISMATCH'}")
+
+    total_update = actual_total if (not total_matches and missing_count == 0) else None
+    did_update = update_checksums_manifest_file(checksums_file, per_file_updates, total_update)
+
+    print("\nVerification summary:")
+    print("-" * 80)
+    print(f"Per-file mismatches : {mismatch_count}")
+    print(f"Missing files       : {missing_count}")
+    print(f"Combined mismatch   : {'Yes' if not total_matches else 'No'}")
+    if did_update:
+        print(f"[UPDATED] {checksums_file} was updated with unmatched SHA256 values.")
+    else:
+        print(f"[OK] {checksums_file} already matched verified values.")
 
 
 def run_command(command: list[str]) -> tuple[int, str, str]:
@@ -1094,6 +1355,7 @@ def start_burn_journey(
     burn_mode: str,
     burned_by: str,
     burn_date: str,
+    verify_after_burn: bool,
 ) -> bool:
     """Guided burn workflow: select drive, review files, confirm or refresh."""
     print("\n" + "=" * 80)
@@ -1115,6 +1377,7 @@ def start_burn_journey(
     print(f"\n✓ Selected drive: {selected_drive['path']} ({selected_drive['model']})")
     print(f"[OK] Media loaded: {selected_drive['media_loaded']}")
     print(f"[OK] Burn capable: {selected_drive['burn_capable']}")
+    print(f"[CONFIG] Verify after burn: {'Enabled' if verify_after_burn else 'Disabled'}")
     # Allow user to set audio disc length (minutes) for fit checks; default 80 minutes
     audio_max_seconds = RED_BOOK_MAX_SECONDS
     audio_capacity_mb = int(round((RED_BOOK_MAX_SECONDS / 60) * 8.75))  # default 80min->~700MB
@@ -1229,6 +1492,10 @@ def start_burn_journey(
             print("[1/3] Preparing disc layout...")
             try:
                 execute_burn(selected_drive, folder_path, content_folder, disc_label, burn_mode)
+                if verify_after_burn:
+                    verify_after_burn_and_sync_checksums(selected_drive, folder_path, burn_mode)
+                else:
+                    print("\n[SKIP] Post-burn verification disabled by flag/config.")
                 removed_files, removed_dirs = clear_content_folder(content_folder)
                 print("\n" + "=" * 80)
                 print("BURN SUCCESSFUL")
@@ -1317,7 +1584,14 @@ def compute_checksums(content_folder: Path, folder_path: Path, burn_mode: str) -
     print(f"{total_checksum}  (total)")
 
 
-def show_options_menu(folder_path: Path, disc_label: str, burn_mode: str, burned_by: str, burn_date: str) -> None:
+def show_options_menu(
+    folder_path: Path,
+    disc_label: str,
+    burn_mode: str,
+    burned_by: str,
+    burn_date: str,
+    verify_after_burn: bool,
+) -> None:
     """Show post-setup options menu."""
     content_folder = folder_path / "content"
     
@@ -1330,7 +1604,15 @@ def show_options_menu(folder_path: Path, disc_label: str, burn_mode: str, burned
         choice = input("\nEnter option: ").strip().upper()
         
         if choice == "B":
-            if start_burn_journey(folder_path, content_folder, disc_label, burn_mode, burned_by, burn_date):
+            if start_burn_journey(
+                folder_path,
+                content_folder,
+                disc_label,
+                burn_mode,
+                burned_by,
+                burn_date,
+                verify_after_burn,
+            ):
                 print("Done.")
                 break
         elif choice == "C":
@@ -1344,9 +1626,18 @@ def show_options_menu(folder_path: Path, disc_label: str, burn_mode: str, burned
 
 
 def main():
+    args = parse_args()
+    config_path = Path(args.config)
+    runtime_config = load_runtime_config(config_path)
+    verify_after_burn = runtime_config["verify_after_burn"]
+    if args.verify_after_burn is not None:
+        verify_after_burn = bool(args.verify_after_burn)
+
     print("=" * 80)
     print("OPTICAL DISC ARCHIVE - New Burn Setup")
     print("=" * 80)
+    print(f"Config file: {config_path}")
+    print(f"Verify after burn: {'Enabled' if verify_after_burn else 'Disabled'}")
     print()
     burn_mode = prompt_burn_mode()
     disc_label = prompt_disc_label()
@@ -1383,7 +1674,7 @@ def main():
         print("Only common player-friendly audio formats will be included in checksums, README summary, and burn staging.")
     print()
     
-    show_options_menu(folder_path, disc_label, burn_mode, burned_by, burn_date)
+    show_options_menu(folder_path, disc_label, burn_mode, burned_by, burn_date, verify_after_burn)
 
 
 if __name__ == "__main__":
